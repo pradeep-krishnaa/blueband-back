@@ -2,6 +2,8 @@ const Express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
 const cors = require('cors');
+const fs = require('fs');
+const csv = require('csv-parser');
 const port = process.env.PORT || 3000;
 
 const app = Express();
@@ -12,8 +14,26 @@ const corsOptions = {
   methods: ['GET', 'POST']
 };
 
+// Store car positions
+const carPositions = new Map();
+
 app.use(cors(corsOptions));
 app.use(Express.json());
+
+
+const trackCoordinates = [];
+
+fs.createReadStream('coordinates.csv')
+  .pipe(csv())
+  .on('data', (row) => {
+    const lat = parseFloat(row.lat);
+    const lng = parseFloat(row.lng);
+    trackCoordinates.push({ lat, lng });
+  })
+  .on('end', () => {
+    console.log('CSV file successfully processed.');
+    //console.log(trackCoordinates);
+  });
 
 function convertToDecimal(degreeString, direction) {
   const degreeLength = direction === 'N' || direction === 'S' ? 2 : 3;
@@ -30,7 +50,7 @@ function convertToDecimal(degreeString, direction) {
 
 function parseNMEA(nmea) {
   const parts = nmea.split(',');
-  
+
   if (parts.length < 9) {
     console.warn('Invalid NMEA data: insufficient parts');
     return null;
@@ -40,16 +60,6 @@ function parseNMEA(nmea) {
 
   if (!rawLat || !latDirection || !rawLon || !lonDirection || !date || !time) {
     console.warn('Invalid NMEA data: missing required fields');
-    return null;
-  }
-
-  if (!/^\d{4}\.\d+$/.test(rawLat) || !/^[NS]$/.test(latDirection)) {
-    console.warn('Invalid NMEA data: invalid latitude');
-    return null;
-  }
-
-  if (!/^\d{5}\.\d+$/.test(rawLon) || !/^[EW]$/.test(lonDirection)) {
-    console.warn('Invalid NMEA data: invalid longitude');
     return null;
   }
 
@@ -63,6 +73,46 @@ function parseNMEA(nmea) {
     speed: parseFloat(speed),
     course: parseFloat(course)
   };
+}
+function findNearestTrackPoint(position) {
+  let nearestPoint = trackCoordinates[0];
+  let minDistance = Infinity;
+
+  for (const point of trackCoordinates) {
+    const distance = Math.sqrt(
+      Math.pow(position.latitude - point.lat, 2) + 
+      Math.pow(position.longitude - point.lng, 2)
+    );
+    if (distance < minDistance) {
+      minDistance = distance;
+      nearestPoint = point;
+    }
+  }
+
+  return trackCoordinates.indexOf(nearestPoint);
+}
+
+function findCarBehind(sosCarId) {
+  const sosCar = carPositions.get(sosCarId);
+  if (!sosCar) return null;
+
+  const sosCarIndex = findNearestTrackPoint(sosCar);
+  let nearestCarBehind = null;
+  let minDistance = Infinity;
+
+  for (const [id, car] of carPositions.entries()) {
+    if (id === sosCarId) continue;
+
+    const carIndex = findNearestTrackPoint(car);
+    const distance = (carIndex - sosCarIndex + trackCoordinates.length) % trackCoordinates.length;
+
+    if (distance > 0 && distance < minDistance) {
+      minDistance = distance;
+      nearestCarBehind = { id, ...car };
+    }
+  }
+
+  return nearestCarBehind;
 }
 
 const io = socketIo(server, {
@@ -89,6 +139,7 @@ app.post('/track', (req, res) => {
     }
 
     const record = { carId, ...parsedData };
+    carPositions.set(carId, record);  // Update car position
     io.emit('locationUpdate', [record]);
     console.log('Emitted record:', record);
     res.status(200).json({ msg: "Location updated successfully" });
@@ -101,8 +152,19 @@ app.post('/track', (req, res) => {
 app.post('/sos', (req, res) => {
   const { carId, message } = req.body;
   const sosMessage = { carId, message, timestamp: new Date() };
-
   io.emit('sos', sosMessage);
+
+  // Find the car behind and send a warning
+  const carBehind = findCarBehind(carId);
+  if (carBehind) {
+    const warningMessage = {
+      carId: carBehind.id,
+      message: `Warning: Car ${carId} ahead has sent an SOS alert. Please proceed with caution.`,
+      timestamp: new Date()
+    };
+    io.emit('warning', warningMessage);
+  }
+
   res.status(200).send({ message: 'SOS alert sent successfully' });
 });
 
