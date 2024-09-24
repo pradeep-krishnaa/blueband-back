@@ -4,7 +4,10 @@ const socketIo = require("socket.io");
 const cors = require('cors');
 const fs = require('fs');
 const csv = require('csv-parser');
-const port = process.env.PORT || 3000;
+const mqtt = require('mqtt');  // Import MQTT
+require('dotenv').config();    // Import dotenv to load environment variables
+
+const port = process.env.PORT || 3000;  // Use environment variable for port
 
 const app = Express();
 const server = http.Server(app);
@@ -20,10 +23,10 @@ const carPositions = new Map();
 app.use(cors(corsOptions));
 app.use(Express.json());
 
-
 const trackCoordinates = [];
 
-fs.createReadStream('coordinates.csv')
+// Reading the CSV file containing track coordinates
+fs.createReadStream('coordinates1.csv')
   .pipe(csv())
   .on('data', (row) => {
     const lat = parseFloat(row.lat);
@@ -32,9 +35,19 @@ fs.createReadStream('coordinates.csv')
   })
   .on('end', () => {
     console.log('CSV file successfully processed.');
-    //console.log(trackCoordinates);
   });
 
+// MQTT Setup
+const mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL || 'mqtt://localhost');  // Use environment variable for MQTT broker URL
+
+mqttClient.on('connect', () => {
+  console.log('MQTT client connected.');
+  mqttClient.subscribe('sim7600/nmea');  // Subscribe to the NMEA data topic
+  mqttClient.subscribe('sim7600/sos');   // Subscribe to SOS alert topic
+  mqttClient.subscribe('sim7600/ok');    // Subscribe to OK alert topic
+});
+
+// Convert degree format (DMS) to decimal format
 function convertToDecimal(degreeString, direction) {
   const degreeLength = direction === 'N' || direction === 'S' ? 2 : 3;
   const degrees = parseInt(degreeString.slice(0, degreeLength));
@@ -48,6 +61,12 @@ function convertToDecimal(degreeString, direction) {
   return decimal;
 }
 
+function isPositionEqual(pos1, pos2, tolerance = 0.0001) {
+  return Math.abs(pos1.lat - pos2.lat) < tolerance && 
+         Math.abs(pos1.lng - pos2.lng) < tolerance;
+}
+
+// Parse NMEA string to extract location data
 function parseNMEA(nmea) {
   const parts = nmea.split(',');
 
@@ -74,11 +93,15 @@ function parseNMEA(nmea) {
     course: parseFloat(course)
   };
 }
+
+// Find the nearest track point to the current position
 function findNearestTrackPoint(position) {
   let nearestPoint = trackCoordinates[0];
   let minDistance = Infinity;
+  let index = 0;
 
-  for (const point of trackCoordinates) {
+  for (let i = 0; i < trackCoordinates.length; i++) {
+    const point = trackCoordinates[i];
     const distance = Math.sqrt(
       Math.pow(position.latitude - point.lat, 2) + 
       Math.pow(position.longitude - point.lng, 2)
@@ -86,35 +109,73 @@ function findNearestTrackPoint(position) {
     if (distance < minDistance) {
       minDistance = distance;
       nearestPoint = point;
+      index = i;
     }
   }
 
-  return trackCoordinates.indexOf(nearestPoint);
+  return { point: nearestPoint, index, distance: minDistance };
 }
 
-function findCarBehind(sosCarId) {
-  const sosCar = carPositions.get(sosCarId);
-  if (!sosCar) return null;
+// MQTT Message Handler
+mqttClient.on('message', (topic, message) => {
+  const payload = JSON.parse(message.toString());
 
-  const sosCarIndex = findNearestTrackPoint(sosCar);
-  let nearestCarBehind = null;
-  let minDistance = Infinity;
+  if (topic === 'sim7600/nmea') {
+    const { carId, nmea } = payload;
 
-  for (const [id, car] of carPositions.entries()) {
-    if (id === sosCarId) continue;
+    if (!nmea || !carId) {
+      console.warn("Invalid NMEA data received");
+      return;
+    }
 
-    const carIndex = findNearestTrackPoint(car);
-    const distance = (carIndex - sosCarIndex + trackCoordinates.length) % trackCoordinates.length;
+    const parsedData = parseNMEA(nmea);
+    if (!parsedData) {
+      console.warn("Failed to parse NMEA data");
+      return;
+    }
 
-    if (distance > 0 && distance < minDistance) {
-      minDistance = distance;
-      nearestCarBehind = { id, ...car };
+    const currentPosition = carPositions.get(carId);
+    const { point: nearestPoint, index: nearestIndex } = findNearestTrackPoint(parsedData);
+
+    if (currentPosition && isPositionEqual(currentPosition, nearestPoint)) {
+      return;
+    }
+
+    const updatedPosition = {
+      carId,
+      latitude: nearestPoint.lat,
+      longitude: nearestPoint.lng,
+      ...parsedData
+    };
+
+    carPositions.set(carId, updatedPosition);
+    io.emit('locationUpdate', [updatedPosition]);  // Broadcast the update to clients
+  }
+
+  if (topic === 'sim7600/sos') {
+    const { carId, message } = payload;
+    const sosMessage = { carId, message, timestamp: new Date() };
+    io.emit('sos', sosMessage);
+
+    const carBehind = findCarBehind(carId);
+    if (carBehind) {
+      const warningMessage = {
+        carId: carBehind.id,
+        message: `Warning: Car ${carId} ahead has sent an SOS alert. Please proceed with caution.`,
+        timestamp: new Date()
+      };
+      io.emit('warning', warningMessage);
     }
   }
 
-  return nearestCarBehind;
-}
+  if (topic === 'sim7600/ok') {
+    const { carId, message } = payload;
+    const okMessage = { carId, message, timestamp: new Date() };
+    io.emit('ok', [okMessage]);
+  }
+});
 
+// Socket.IO setup for frontend communication
 const io = socketIo(server, {
   cors: {
     origin: "*",
@@ -122,64 +183,11 @@ const io = socketIo(server, {
   },
 });
 
-app.post('/track', (req, res) => {
-  try {
-    console.log('Received data from SIM7600E-H:', req.body);
-
-    const { nmea, carId } = req.body;
-    if (!nmea || !carId) {
-      res.status(400).json({ msg: "Invalid data received" });
-      return;
-    }
-
-    const parsedData = parseNMEA(nmea);
-    if (!parsedData) {
-      res.status(400).json({ msg: "Invalid NMEA data" });
-      return;
-    }
-
-    const record = { carId, ...parsedData };
-    carPositions.set(carId, record);  // Update car position
-    io.emit('locationUpdate', [record]);
-    console.log('Emitted record:', record);
-    res.status(200).json({ msg: "Location updated successfully" });
-  } catch (err) {
-    console.error('Error handling data:', err);
-    res.status(500).json({ msg: "Internal Server Error" });
-  }
-});
-
-app.post('/sos', (req, res) => {
-  const { carId, message } = req.body;
-  const sosMessage = { carId, message, timestamp: new Date() };
-  io.emit('sos', sosMessage);
-
-  // Find the car behind and send a warning
-  const carBehind = findCarBehind(carId);
-  if (carBehind) {
-    const warningMessage = {
-      carId: carBehind.id,
-      message: `Warning: Car ${carId} ahead has sent an SOS alert. Please proceed with caution.`,
-      timestamp: new Date()
-    };
-    io.emit('warning', warningMessage);
-  }
-
-  res.status(200).send({ message: 'SOS alert sent successfully' });
-});
-
-app.post('/ok', (req, res) => {
-  const { carId, message } = req.body;
-  const okMessage = { carId, message, timeStamp: new Date() };
-  io.emit("ok", [okMessage]);
-  console.log("OK status updated", carId);
-  res.status(200).send([{ okMessage, message: `OK status updated ${carId}` }]);
-});
-
 io.on('connection', (socket) => {
-  console.log("Connected to device", socket.id);
+  console.log("Client connected:", socket.id);
 });
 
+// Start the server
 server.listen(port, () => {
-  console.log("Listening at:", port);
+  console.log("Server listening on port:", port);
 });
