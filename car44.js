@@ -2,15 +2,13 @@ const Express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
 const cors = require('cors');
-const fs = require('fs');
-const csv = require('csv-parser');
 const mqtt = require('mqtt');  // Import MQTT
 require('dotenv').config();    // Import dotenv to load environment variables
 
-const port = process.env.PORT || 3000;  // Use environment variable for port
-
 const app = Express();
 const server = http.Server(app);
+
+const port = process.env.PORT || 3000;
 
 const corsOptions = {
   origin: "*",
@@ -23,22 +21,8 @@ const carPositions = new Map();
 app.use(cors(corsOptions));
 app.use(Express.json());
 
-const trackCoordinates = [];
-
-// Reading the CSV file containing track coordinates
-fs.createReadStream('coordinates1.csv')
-  .pipe(csv())
-  .on('data', (row) => {
-    const lat = parseFloat(row.lat);
-    const lng = parseFloat(row.lng);
-    trackCoordinates.push({ lat, lng });
-  })
-  .on('end', () => {
-    console.log('CSV file successfully processed.');
-  });
-
 // MQTT Setup
-const mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL || 'mqtt://localhost');  // Use environment variable for MQTT broker URL
+const mqttClient = mqtt.connect(process.env.MQTT_BROKER_URL || 'mqtt://35.200.163.26:1883');
 
 mqttClient.on('connect', () => {
   console.log('MQTT client connected.');
@@ -47,7 +31,7 @@ mqttClient.on('connect', () => {
   mqttClient.subscribe('sim7600/ok');    // Subscribe to OK alert topic
 });
 
-// Convert degree format (DMS) to decimal format
+
 function convertToDecimal(degreeString, direction) {
   const degreeLength = direction === 'N' || direction === 'S' ? 2 : 3;
   const degrees = parseInt(degreeString.slice(0, degreeLength));
@@ -61,26 +45,63 @@ function convertToDecimal(degreeString, direction) {
   return decimal;
 }
 
-function isPositionEqual(pos1, pos2, tolerance = 0.0001) {
-  return Math.abs(pos1.lat - pos2.lat) < tolerance && 
-         Math.abs(pos1.lng - pos2.lng) < tolerance;
+function parseDate(dateString) {
+  const day = dateString.slice(0, 2);
+  const month = dateString.slice(2, 4);
+  const year = dateString.slice(4, 6);
+  return `20${year}-${month}-${day}`;
 }
 
-// Parse NMEA string to extract location data
-function parseNMEA(nmea) {
-  const parts = nmea.split(',');
+function parseTime(timeString) {
+  const hours = timeString.slice(0, 2);
+  const minutes = timeString.slice(2, 4);
+  const seconds = timeString.slice(4);
+  return `${hours}:${minutes}:${seconds}`;
+}
 
+function isValidNMEA(parts) {
   if (parts.length < 9) {
-    console.warn('Invalid NMEA data: insufficient parts');
-    return null;
+    return false;
   }
 
-  const [rawLat, latDirection, rawLon, lonDirection, date, time, altitude, speed, course] = parts;
+  const [rawLat, latDirection, rawLon, lonDirection, date, time] = parts;
 
   if (!rawLat || !latDirection || !rawLon || !lonDirection || !date || !time) {
-    console.warn('Invalid NMEA data: missing required fields');
+    return false;
+  }
+
+  if (!/^\d{2}\d+\.\d+$/.test(rawLat) || !/^[NS]$/.test(latDirection)) {
+    return false;
+  }
+
+  if (!/^\d{3}\d+\.\d+$/.test(rawLon) || !/^[EW]$/.test(lonDirection)) {
+    return false;
+  }
+
+  if (!/^\d{6}$/.test(date) || !/^\d{6}\.\d$/.test(time)) {
+    return false;
+  }
+
+  return true;
+}
+
+function parseData(data) {
+  const parts = data.split(',');
+
+  if (!isValidNMEA(parts)) {
+    console.warn('Invalid NMEA data');
     return null;
   }
+
+  const rawLat = parts[0];
+  const latDirection = parts[1];
+  const rawLon = parts[2];
+  const lonDirection = parts[3];
+  const date = parts[4];
+  const time = parts[5];
+  const altitude = parseFloat(parts[6]);
+  const speed = parseFloat(parts[7]);
+  const course = parseFloat(parts[8]);
 
   const latitude = convertToDecimal(rawLat, latDirection);
   const longitude = convertToDecimal(rawLon, lonDirection);
@@ -88,35 +109,13 @@ function parseNMEA(nmea) {
   return {
     latitude,
     longitude,
-    altitude: parseFloat(altitude),
-    speed: parseFloat(speed),
-    course: parseFloat(course)
+    date: parseDate(date),
+    time: parseTime(time),
+    altitude,
+    speed,
+    course
   };
 }
-
-// Find the nearest track point to the current position
-function findNearestTrackPoint(position) {
-  let nearestPoint = trackCoordinates[0];
-  let minDistance = Infinity;
-  let index = 0;
-
-  for (let i = 0; i < trackCoordinates.length; i++) {
-    const point = trackCoordinates[i];
-    const distance = Math.sqrt(
-      Math.pow(position.latitude - point.lat, 2) + 
-      Math.pow(position.longitude - point.lng, 2)
-    );
-    if (distance < minDistance) {
-      minDistance = distance;
-      nearestPoint = point;
-      index = i;
-    }
-  }
-
-  return { point: nearestPoint, index, distance: minDistance };
-}
-
-// MQTT Message Handler
 mqttClient.on('message', (topic, message) => {
   const payload = JSON.parse(message.toString());
 
@@ -134,17 +133,11 @@ mqttClient.on('message', (topic, message) => {
       return;
     }
 
-    const currentPosition = carPositions.get(carId);
-    const { point: nearestPoint, index: nearestIndex } = findNearestTrackPoint(parsedData);
-
-    if (currentPosition && isPositionEqual(currentPosition, nearestPoint)) {
-      return;
-    }
-
+    // Directly update the car's position
     const updatedPosition = {
       carId,
-      latitude: nearestPoint.lat,
-      longitude: nearestPoint.lng,
+      latitude: parsedData.latitude,
+      longitude: parsedData.longitude,
       ...parsedData
     };
 
@@ -156,22 +149,13 @@ mqttClient.on('message', (topic, message) => {
     const { carId, message } = payload;
     const sosMessage = { carId, message, timestamp: new Date() };
     io.emit('sos', sosMessage);
-
-    const carBehind = findCarBehind(carId);
-    if (carBehind) {
-      const warningMessage = {
-        carId: carBehind.id,
-        message: `Warning: Car ${carId} ahead has sent an SOS alert. Please proceed with caution.`,
-        timestamp: new Date()
-      };
-      io.emit('warning', warningMessage);
-    }
   }
 
   if (topic === 'sim7600/ok') {
     const { carId, message } = payload;
     const okMessage = { carId, message, timestamp: new Date() };
     io.emit('ok', [okMessage]);
+    console.log("OK status updated", carId);
   }
 });
 
