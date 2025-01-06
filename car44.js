@@ -11,7 +11,7 @@ const server = http.Server(app);
 const port = process.env.PORT || 3000;
 
 const corsOptions = {
-  origin: "https://blueband-frontend-6tjfcr9bk-siddharth-ss-projects-5c0ebc7f.vercel.app",
+  origin: "*",
   methods: ['GET', 'POST']
 };
 
