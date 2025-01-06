@@ -85,7 +85,7 @@ function isValidNMEA(parts) {
   return true;
 }
 
-function parseData(data) {
+function parseNMEA(data) {
   const parts = data.split(',');
 
   if (!isValidNMEA(parts)) {
